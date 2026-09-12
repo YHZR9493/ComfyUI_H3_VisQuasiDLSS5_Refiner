@@ -103,7 +103,6 @@ YOLO-World 引导的 MiniMax H3 视频**局部修复（Refine）**节点
 
 ## 兼容性
 
-- 旧节点名 `H3YoloWorldDefineRefine` 仍可加载，行为与 `H3VisQuasiDLSS5Refiner` 完全一致。
 - 需要 ComfyUI 已提供 MiniMax H3 官方节点支持（`comfy_extras.nodes_minimax_h3`）。
 
 ## License
