@@ -17,7 +17,6 @@ YOLO-World 引导的 MiniMax H3 视频**局部修复（Refine）**节点 —— 
   - `full_frame_repair = false`：盒级局部修复，YOLO 检测 → 类名注入修复 Prompt。
 - **Headless RTX VSR**（可选）：内置 `nvvfx` 同倍率（1x，不放大）RTX Video Super Resolution 清理 + 时域 DC 稳定，失败自动降级放行，不影响 H3 修复结果。
 - **检测加速**：`detect_step > 1` 时只对采样帧推理，中间帧复用最近一帧的检测框，配合时间 Mask 平滑容忍误差。
-- **旧节点名兼容**：同时注册 `H3VisQuasiDLSS5Refiner` 与旧名 `H3YoloWorldDefineRefine`，旧工作流无需改动即可加载。
 - **自包含**：检测、潜空间注入、条件构建、采样、回贴全部基于 ComfyUI 官方核心（`comfy_extras.nodes_minimax_h3` 等）实现，不依赖 Director / FaceRefine 插件包。
 
 ## 安装
