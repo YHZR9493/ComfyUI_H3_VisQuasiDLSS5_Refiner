@@ -448,9 +448,12 @@ def _rtx_vsr_enhance(images, quality="ULTRA", *, window=5, dc_clip=0.03):
         return images
 
     try:
-        # target = source (same-multiple, 1x) snapped to the 8px grid
-        out_w = max(8, round(W / 8) * 8)
-        out_h = max(8, round(H / 8) * 8)
+        # target = 1.5x upscale snapped to the 8px grid, then lanczos back to
+        # the original resolution so the superres-consistent texture stays
+        # while the frame size is unchanged.
+        _SCALE = 1.5
+        out_w = max(8, round(W * _SCALE / 8) * 8)
+        out_h = max(8, round(H * _SCALE / 8) * 8)
         nvvfx_sr.output_width = out_w
         nvvfx_sr.output_height = out_h
         if hasattr(nvvfx_sr, "load"):
@@ -462,7 +465,7 @@ def _rtx_vsr_enhance(images, quality="ULTRA", *, window=5, dc_clip=0.03):
 
         upscaled = []
         for i in range(N):
-            frame = frames_chw[i]
+            frame = frames_chw[i].contiguous()
             if frame.device.type != "cuda":
                 frame = frame.cuda()
             try:
@@ -483,6 +486,78 @@ def _rtx_vsr_enhance(images, quality="ULTRA", *, window=5, dc_clip=0.03):
             ctx.__exit__(None, None, None)
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# De-fog / de-haze post filter (optional, "evil-cult dehaze" style)
+# ---------------------------------------------------------------------------
+def _defog(images, strength: float = 0.5, block: int = 16):
+    """Haze-removal look: build an enhanced layer from the frames, then
+    hard-light blend it back over the original.
+
+    Per-pipeline (all on the enhancement layer):
+      1) brightness up
+      2) glow / highlight down (soft shoulder compression)
+      3) local sharpening up (unsharp mask, box-blur pyramid)
+      4) shadow lift (dark areas weakened / de-clipped)
+    final blend: hard_light(original, layer) instead of soft light, for a
+    punchier local-contrast match with the 'DLSS5' refiner look; then lerp
+    by `strength`.
+    Pure torch, processed in T-blocks to stay VRAM-safe on 8GB cards.
+    """
+    if strength is None or float(strength) <= 0.0:
+        return images
+    torch = _torch()
+    import torch.nn.functional as F
+
+    strength = float(min(1.0, max(0.0, strength)))
+    x = images[..., :3].float()
+    T = x.shape[0]
+    if T == 0:
+        return images
+
+    block = max(1, int(block))
+
+    def _blur_soft(t):
+        """Box-blur pyramid approximation of a gaussian (channels-last)."""
+        b = t.movedim(-1, 1)                      # [T,3,H,W]
+        for _ in range(3):
+            b = F.avg_pool2d(b, 3, 1, padding=1)  # kernel3/stride1/pad1 -> size kept
+        return b.movedim(1, -1)
+
+    def _hard_light(base, blend):
+        """Photoshop hard light blend on [0,1]: stronger contrast punch than
+        soft light. Semantics invert the layer as the 'light source':
+          blend <= 0.5 : multiply  -> out = 2 * base * blend   (darken)
+          blend >  0.5 : screen    -> out = 1 - 2*(1-base)*(1-blend) (lighten)
+        Unlike multiply alone it also lightens highlights, so it punches
+        local contrast without uniformly crushing brightness."""
+        m = (blend <= 0.5).float()
+        dark = 2.0 * base * blend
+        light = 1.0 - 2.0 * (1.0 - base) * (1.0 - blend)
+        return base * m + light * (1.0 - m)
+
+    def _defog_block(xb):
+        # 1) brightness up
+        layer = xb * 1.10
+        # 2) glow / highlight down
+        glow = (layer - 0.72).clamp_min(0.0)
+        layer = layer - glow * 0.45
+        # 3) sharpening up (stronger: 0.6 -> 0.8)
+        layer = layer + (layer - _blur_soft(layer)) * 0.8
+        # 4) shadow lift (stronger: gain 0.5 -> 0.65)
+        shadow = (0.35 - layer).clamp_min(0.0)
+        layer = layer + shadow * 0.65
+        layer = layer.clamp(0.0, 1.0)
+        # 5) hard-light blend + strength lerp
+        out = _hard_light(xb, layer)
+        return xb + (out - xb) * strength
+
+    outs = []
+    for s in range(0, T, block):
+        outs.append(_defog_block(x[s:s + block]))
+    out = torch.cat(outs, dim=0).clamp(0.0, 1.0)
+    return out.to(images.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +652,19 @@ class H3VisQuasiDLSS5Refiner:
                     list(RTX_QUALITY_LEVELS),
                     {"default": "ULTRA"},
                 ),
+                # De-fog / de-haze post look (optional, multiply-blend layer)
+                "defog_enabled": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "De-fog ('evil-cult dehaze') post look: brighten + glow-down "
+                        "+ sharpen + shadow-lift an enhancement layer, then multiply-blend it "
+                        "back over the repaired clip. Pure torch, applied after RTX enhance.",
+                    },
+                ),
+                "defog_strength": (
+                    "FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05},
+                ),
             },
         }
 
@@ -601,7 +689,8 @@ class H3VisQuasiDLSS5Refiner:
             chunk_frames=124, denoise=0.32, steps=4, cfg=1.0, seed=0,
             sampler="euler", scheduler="karras", shift_video=12.0, shift_audio=3.0,
             detect_step=1, full_frame_repair=True,
-            rtx_enhance=True, rtx_quality="ULTRA"):
+            rtx_enhance=True, rtx_quality="ULTRA",
+            defog_enabled=False, defog_strength=0.5):
         torch = _torch()
         if images is None or images.shape[0] == 0:
             raise ValueError("H3VisQuasiDLSS5Refiner: empty input images.")
@@ -722,9 +811,13 @@ class H3VisQuasiDLSS5Refiner:
         if bool(rtx_enhance):
             result = _rtx_vsr_enhance(result, str(rtx_quality))
 
+        # 6) optional de-fog / de-haze look (multiply-blend enhanced layer).
+        if bool(defog_enabled):
+            result = _defog(result, float(defog_strength))
+
         keep = result.to(images.dtype)
-        if has_boxes:
+        if has_boxes or bool(rtx_enhance) or bool(defog_enabled):
             return (keep, prompt)
-        # no detections: return input unchanged
+        # no detection & no repair/enhance pass active: return input unchanged
         return (images, prompt)
 
