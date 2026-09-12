@@ -1,6 +1,13 @@
 # ComfyUI_H3_VisQuasiDLSS5_Refiner
 
 ![ComfyUI](https://img.shields.io/badge/ComfyUI-✓-orange) ![MiniMax_H3](https://img.shields.io/badge/MiniMax%20H3-✓-blue) ![License](https://img.shields.io/badge/License-Apache--2.0-green)
+## 完整说明
+
+H3 Vis Quasi-DLSS5 Refiner 是一款面向 MiniMax H3 视频生成管线的修复增强节点。它借鉴 GPU 实时超分（如 DLSS）"以重生成代替直出"的思路，将二次采样技术落地为视频级画质修复：不追求像素级重建，而是让模型对目标区域做低强度潜空间重生成（re-generate）——以较低的 denoise 对画面进行二次采样，让模型在原有结构基础上"重新画一遍"，在回收伪影、抹除瑕疵的同时补回细节，实现近似超分 / 修复的观感提升。
+
+因这种"低 denoise 重生成模拟超分增强"的运作逻辑与 DLSS 的"重建优于渲染"理念一脉相承，故命名为 Quasi-DLSS5——"类似 DLSS5"，而非真实的深度学习超分辨率。
+
+核心流程：开放词汇目标检测（YOLO-World）→ Prompt 注入 → 分块潜空间重生成 → Mask 羽化回贴，整条链路自动完成，用户只需指定要修复的目标和强度。
 
 YOLO-World 引导的 MiniMax H3 视频**局部修复（Refine）**节点 —— 由 `ComfyUI_MiniMaxH3_Director` 独立拆出、功能不变的独立插件包。
 
@@ -18,6 +25,7 @@ YOLO-World 引导的 MiniMax H3 视频**局部修复（Refine）**节点 —— 
 - **Headless RTX VSR**（可选）：内置 `nvvfx` 同倍率（1x，不放大）RTX Video Super Resolution 清理 + 时域 DC 稳定，失败自动降级放行，不影响 H3 修复结果。
 - **检测加速**：`detect_step > 1` 时只对采样帧推理，中间帧复用最近一帧的检测框，配合时间 Mask 平滑容忍误差。
 - **自包含**：检测、潜空间注入、条件构建、采样、回贴全部基于 ComfyUI 官方核心（`comfy_extras.nodes_minimax_h3` 等）实现，不依赖 Director / FaceRefine 插件包。
+- 
 
 ## 安装
 
