@@ -9,7 +9,7 @@ H3 Vis Quasi-DLSS5 Refiner 是一款面向 MiniMax H3 视频生成管线的修�
 
 核心流程：开放词汇目标检测（YOLO-World）→ Prompt 注入 → 分块潜空间重生成 → Mask 羽化回贴，整条链路自动完成，用户只需指定要修复的目标和强度。
 
-YOLO-World 引导的 MiniMax H3 视频**局部修复（Refine）**节点 —— 由 `ComfyUI_MiniMaxH3_Director` 独立拆出、功能不变的独立插件包。
+YOLO-World 引导的 MiniMax H3 视频**局部修复（Refine）**节点 
 
 检测 → Prompt 定义 → 分块潜空间重生成 → Mask 羽化回贴，整条管线收敛在**单个节点**内完成，不改动检测区域之外的任何像素。
 
