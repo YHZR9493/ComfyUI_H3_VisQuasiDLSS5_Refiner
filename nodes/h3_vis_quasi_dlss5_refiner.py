@@ -369,6 +369,64 @@ def _split_video_latent(video_vae, latent):
     return args[0], args[1]
 
 
+def _resample_blocks(model, clip, video_vae, video, canvas_w, canvas_h, prompt,
+                     negative_prompt, *, chunk_frames, denoise, steps, cfg, seed,
+                     sampler, scheduler, shift_video, shift_audio):
+    """Chunked latent re-generation of `video` (channels-last [T,H,W,3]) at a
+    fixed canvas. Encodes real frames into the H3 AV latent template (img2img
+    start point), samples each temporal chunk, decodes and returns the refined
+    clip [T,H,W,3] trimmed back to T. Works for both whole frames and the
+    enlarged crops used by the FaceRefine-style repair.
+    """
+    torch = _torch()
+    T = video.shape[0]
+    aligned_chunk = _align_frame_count(int(chunk_frames))
+    chunks = []
+    for start in range(0, T, aligned_chunk):
+        chunks.append((start, min(start + aligned_chunk, T)))
+
+    out_frames = []
+    for cidx, (cs, ce) in enumerate(chunks):
+        block_rgb = video[cs:ce]  # [b,H,W,3]
+        length = ce - cs
+        aligned_len = _align_frame_count(length)
+
+        first_frame = _resize(block_rgb[:1], canvas_w, canvas_h, "disabled")
+        last_frame = _resize(block_rgb[-1:], canvas_w, canvas_h, "center")
+        positive, template_latent = _build_conditioning(
+            clip, video_vae, prompt, canvas_w, canvas_h, aligned_len,
+            first_frame, last_frame,
+        )
+
+        if length != aligned_len:
+            pad_n = aligned_len - length
+            tail = block_rgb[-1:].repeat(pad_n, 1, 1, 1)
+            block_enc = torch.cat([block_rgb, tail], dim=0)
+        else:
+            block_enc = block_rgb
+
+        latent = _encode_block_into_latent(video_vae, block_enc, template_latent)
+
+        negative = None
+        if float(cfg) > 1.0 and negative_prompt and negative_prompt.strip():
+            negative = clip.encode_from_tokens_scheduled(
+                clip.tokenize(negative_prompt),
+            )
+
+        sampled = _sample_block(
+            model, positive, negative, latent,
+            seed=seed + cidx, cfg=cfg, steps=steps, denoise=denoise,
+            sampler_name=sampler, scheduler=scheduler,
+            shift_video=shift_video, shift_audio=shift_audio,
+        )
+
+        sample_dict = sampled if isinstance(sampled, dict) else {"samples": sampled}
+        video_latent, _ = _split_video_latent(video_vae, sample_dict)
+        out_frames.append(_decode_video(video_vae, video_latent))
+
+    return torch.cat(out_frames, dim=0)[:T]
+
+
 def _blend(original, refined, mask):
     """refined over original, weighted by per-frame mask.
 
@@ -381,44 +439,200 @@ def _blend(original, refined, mask):
 
 
 # ---------------------------------------------------------------------------
-# RTX VSR headless enhancement (same-multiple, in-node)
+# FaceRefine-style enlarged-crop repair (face / hand)
+# ---------------------------------------------------------------------------
+def _colour_match_patch(src, ref, strength):
+    """Align per-channel mean/std of `src` patch to `ref` region.
+
+    Kill the seam contrast jump between the regenerated crop and the untouched
+    surrounding footage (same idea as FaceRefine's colour_match).
+    """
+    torch = _torch()
+    if src.shape[:2] != ref.shape[:2]:
+        src = _resize(src.unsqueeze(0), int(ref.shape[1]), int(ref.shape[0]),
+                      "center")[0]
+    s = src.float()
+    r = ref.float()
+    s_mean = s.mean(dim=(0, 1))
+    r_mean = r.mean(dim=(0, 1))
+    s_std = s.std(dim=(0, 1), unbiased=False) + 1e-6
+    r_std = r.std(dim=(0, 1), unbiased=False) + 1e-6
+    matched = (s - s_mean) / s_std * r_std + r_mean
+    out = s * (1.0 - strength) + matched * strength
+    return out.clamp(0, 1).to(dtype=src.dtype)
+
+
+def _build_crop_video(images, boxes_list, canvas: int):
+    """Build one enlarged-crop video from per-frame detected boxes.
+
+    Every detected face/hand region of a frame is lanczos-resized into a
+    fixed-size slot of a shared square canvas (grid layout, stable across the
+    whole clip). Empty excess slots are filled with a down-scaled copy of the
+    frame so the H3 re-sample always sees natural footage everywhere (those
+    filler slots are never pasted back). Returns the crop video
+    [T,C,C,3] (C snapped to a 16-multiple) plus a per-frame slot map and the
+    resulting canvas size.
+    """
+    torch = _torch()
+    T, H, W = images.shape[0], images.shape[1], images.shape[2]
+    n_max = max((len(b) for b in boxes_list), default=0)
+    n_max = max(1, n_max)
+    cols = min(4, n_max)
+    rows = math.ceil(n_max / cols)
+    # 16-aligned square layout: slot pitch snapped, so the crop canvas stays a
+    # clean multiple for the H3 latent grid.
+    slot = max(16, (int(canvas) // max(cols, rows)) // 16 * 16)
+    canvas_final = max(16, (slot * max(cols, rows)) // 16 * 16)
+    slot = canvas_final // max(cols, rows)  # re-derive after final snap
+
+    crop_video = torch.zeros([T, canvas_final, canvas_final, 3],
+                             dtype=images.dtype, device=images.device)
+    slot_map = []
+    for t in range(T):
+        boxes_t = boxes_list[t]
+        n_t = len(boxes_t)
+        frame_slots = []
+        for k in range(n_max):
+            sx = (k % cols) * slot
+            sy = (k // cols) * slot
+            if k < n_t:
+                b = boxes_t[k]
+                x0, y0 = int(max(0, b[0])), int(max(0, b[1]))
+                x1, y1 = int(min(W, b[2])), int(min(H, b[3]))
+                if x1 > x0 and y1 > y0:
+                    reg = _resize(images[t, y0:y1, x0:x1].unsqueeze(0),
+                                  slot, slot, "center")
+                    crop_video[t, sy:sy + slot, sx:sx + slot] = reg[0]
+                    frame_slots.append({
+                        "x": sx, "y": sy, "w": slot, "h": slot,
+                        "bx0": x0, "by0": y0, "bx1": x1, "by1": y1,
+                    })
+                    continue
+            # filler slot (no box on this frame / degenerate box): downscale
+            # the whole frame so the crop video has natural content there.
+            fill = _resize(images[t:t + 1].contiguous(), slot, slot, "center")
+            crop_video[t, sy:sy + slot, sx:sx + slot] = fill[0]
+        slot_map.append(frame_slots)
+    return crop_video, slot_map, canvas_final
+
+
+def _paste_crops_back(base_images, refined_crops, slot_map, *, mask,
+                      colour_match=0.8, dilation=0):
+    """Warp regenerated crop slots back onto their detected boxes.
+
+    base_images: [T,H,W,3]; untouched regions stay pixel-identical.
+    refined_crops: [T,C,C,3] regenerated enlarged crops.
+    slot_map: per-frame list of {x,y,w,h,bx0,by0,bx1,by1} (original-film boxes).
+    mask: [T,H,W] blend weight built from the same boxes (dilation+feather).
+    dilation: overlap the pasted patch by this many px beyond every box edge,
+      so the feathered blend mask only ever interpolates across the *buffer*
+      band around each box, never reaching inside the regenerated core --
+      without this the mask (<1 at the box edge) would eat away part of the
+      repaired content and leave a translucent seam.
+    """
+    torch = _torch()
+    H, W = base_images.shape[1], base_images.shape[2]
+    dx = max(0, int(dilation))
+    result = base_images.clone()
+    for t, frame_slots in enumerate(slot_map):
+        base_t = base_images[t]
+        for sl in frame_slots:
+            patch = refined_crops[t, sl["y"]:sl["y"] + sl["h"],
+                                  sl["x"]:sl["x"] + sl["w"]]
+            rx0 = max(0, int(sl["bx0"]) - dx)
+            ry0 = max(0, int(sl["by0"]) - dx)
+            rx1 = min(W, int(sl["bx1"]) + dx)
+            ry1 = min(H, int(sl["by1"]) + dx)
+            bw = rx1 - rx0
+            bh = ry1 - ry0
+            if bw <= 0 or bh <= 0:
+                continue
+            patch = _resize(patch.unsqueeze(0).contiguous(), bw, bh, "center")[0]
+            if colour_match and colour_match > 0:
+                ref = base_t[ry0:ry1, rx0:rx1]
+                patch = _colour_match_patch(patch, ref, float(colour_match))
+            result[t, ry0:ry1, rx0:rx1] = patch
+    return _blend(base_images, result, mask)
+
+
+# ---------------------------------------------------------------------------
+# RTX VSR headless enhancement (in-node, optional upscale kept)
 # ---------------------------------------------------------------------------
 RTX_QUALITY_LEVELS = ("LOW", "MEDIUM", "HIGH", "ULTRA")
 
 
-def _temporal_dc_stabilize(frames, *, window=5, clip=0.03):
+def _temporal_dc_stabilize(frames, *, window=5, clip=0.03, dc_chunk=16):
     """Sliding-median DC (per-channel mean) smoothing across frames.
 
     nvvfx VSR processes frames independently -> bright/color level jumps on
     fast motion. Cache per-channel means in a small window, clamp each frame's
     DC to the window median and renormalize. Identity on non-flickering
     footage.
+
+    VRAM-safe: per-frame channel means are accumulated block by block (only a
+    `dc_chunk`-sized float window is ever materialised at once) and the final
+    correction is applied in-place per block on a single clone of the input --
+    no full-batch float copy + clone + clamp triple allocation, which spiked
+    an extra ~2x the clip on 8GB cards and was the OOM trigger.
     """
     torch = _torch()
     n = int(frames.shape[0])
     if n < 3:
         return frames
-    fr = frames.float()
-    means = fr.mean(dim=(1, 2))  # [n,3]
-    res = fr.clone()
+    dev = frames.device
+    dt = frames.dtype
+    block = max(1, int(dc_chunk))
+    # 1) per-frame channel means, accumulated chunk by chunk (peak = one chunk)
+    means = torch.empty(n, 3, dtype=torch.float32, device=dev)
+    for c0 in range(0, n, block):
+        b = frames[c0:c0 + block].float()
+        means[c0:c0 + block].copy_(b.mean(dim=(1, 2)))
+        del b
+    # 2) DC correction coefficients (tiny [n,3] tensor)
+    coeff = torch.empty_like(means)
     for i in range(n):
         lo, hi = max(0, i - window // 2), min(n, i + window // 2 + 1)
         med = means[lo:hi].median(dim=0).values
-        fac = (med / (means[i] + 1e-6)).clamp(1.0 - clip, 1.0 + clip)
-        res[i] *= fac.view(1, 1, 3)
-    return torch.clamp(res, 0.0, 1.0).to(device=frames.device, dtype=frames.dtype)
+        coeff[i].copy_(
+            (med / (means[i] + 1e-6)).clamp(1.0 - clip, 1.0 + clip)
+        )
+    # 3) apply in-place per block on one clone (peak = clone + one block)
+    res = frames.clone()
+    if dt in (torch.float16, torch.float32, torch.bfloat16):
+        for c0 in range(0, n, block):
+            blk = res[c0:c0 + block]
+            blk.mul_(coeff[c0:c0 + block].view(-1, 1, 1, 3))
+            torch.clamp_(blk, 0.0, 1.0)
+    else:
+        # integer inputs: convert per block (small temp) and write back
+        for c0 in range(0, n, block):
+            blk = res[c0:c0 + block]
+            blk.copy_(
+                torch.clamp(
+                    blk.float() * coeff[c0:c0 + block].view(-1, 1, 1, 3),
+                    0.0, 1.0,
+                )
+            )
+    return res
 
 
-def _rtx_vsr_enhance(images, quality="ULTRA", *, window=5, dc_clip=0.03):
-    """Block-wise NVIDIA RTX Video Super Resolution at the same resolution.
+def _rtx_vsr_enhance(images, quality="ULTRA", *, scale=1.5, keep_upscaled=False,
+                     detail_strength=0.85, window=5, dc_clip=0.03):
+    """Headless NVIDIA RTX Video Super Resolution.
 
-    Feeds each decoded frame through nvvfx.VideoSuperRes targeting the SAME
-    canvas (1x, no upscale) and applies a light temporal DC smoothing to kill
-    per-frame luminance/color flicker. The whole pass runs headless inside
-    this node so the workflow does not need a separate RTXVideoSuperResolution
-    node; canvas is kept identical to the input (same-multiple sampling). Any
-    nvvfx / GPU issue is non-fatal: the H3 repair output is passed through
-    untouched.
+    Feeds every frame through nvvfx.VideoSuperRes targeting `scale` x
+    enlargement (snapped to the 8px nvvfx grid). Behaviour of the result:
+      * keep_upscaled=True  -> the enlarged clip is output at the upscaled
+        resolution (max detail, larger output, slower downstream).
+      * keep_upscaled=False -> the enlarged super-res clip is shrunk back to
+        the original resolution AND the super-res detail (SR reconstruction
+        minus a plain upsample of the input) is injected back during the
+        shrink. This keeps the output size identical to the input (no extra
+        downstream cost) while retaining most of the sharpness the AI rebuild
+        produced -- a content-aware detail-preserving downscale, far sharper
+        than a plain lanczos shrink-back.
+    A light temporal DC smoothing kills per-frame flicker. Fully in-node;
+    any nvvfx / GPU issue is non-fatal and passes the input through.
     """
     try:
         import nvvfx
@@ -448,10 +662,8 @@ def _rtx_vsr_enhance(images, quality="ULTRA", *, window=5, dc_clip=0.03):
         return images
 
     try:
-        # target = 1.5x upscale snapped to the 8px grid, then lanczos back to
-        # the original resolution so the superres-consistent texture stays
-        # while the frame size is unchanged.
-        _SCALE = 1.5
+        # target `scale` x upscale snapped to the 8px grid.
+        _SCALE = float(max(1.0, min(2.0, scale)))
         out_w = max(8, round(W * _SCALE / 8) * 8)
         out_h = max(8, round(H * _SCALE / 8) * 8)
         nvvfx_sr.output_width = out_w
@@ -459,26 +671,49 @@ def _rtx_vsr_enhance(images, quality="ULTRA", *, window=5, dc_clip=0.03):
         if hasattr(nvvfx_sr, "load"):
             nvvfx_sr.load()
 
-        # block-wise: bound concurrent pixels so an 8GB card never explodes
-        MAX_PIXELS = 1024 * 1024 * 16
-        per_batch = max(1, MAX_PIXELS // max(1, out_w * out_h))
-
-        upscaled = []
+        # VRAM-safe streaming: preallocate one output clip and write each
+        # super-res frame straight into it. The old code collected every
+        # enlarged frame into a python list and then torch.stack()ed them,
+        # materialising TWO full upscaled clips at once (for 640x1152x248 @1.5x
+        # that was ~10 GB alone) -- the OOM trigger. Now the peak is a single
+        # output clip + one enlarged frame, regardless of clip length.
+        if bool(keep_upscaled):
+            out = torch.empty(N, out_h, out_w, 3, dtype=torch.float32,
+                              device=rgb.device)
+        else:
+            out = torch.empty(N, H, W, 3, dtype=torch.float32,
+                              device=rgb.device)
         for i in range(N):
             frame = frames_chw[i].contiguous()
             if frame.device.type != "cuda":
                 frame = frame.cuda()
             try:
                 dlpack_out = nvvfx_sr.run(frame).image
-                upscaled.append(torch.from_dlpack(dlpack_out).movedim(0, -1).clone())
+                sr_i = torch.from_dlpack(dlpack_out).movedim(0, -1).clone()
             except Exception:
-                upscaled.append(rgb[i])
-        if len(upscaled) != N:
-            return images
+                # per-frame fallback: upscaled copy of the original frame
+                sr_i = _resize(rgb[i].unsqueeze(0), out_w, out_h, "center")[0]
+            del frame
+            if bool(keep_upscaled):
+                out[i].copy_(sr_i)
+            else:
+                # ---- detail-preserving shrink-back to the original frame ----
+                # Plain shrink loses the high frequencies the SR rebuild added.
+                # Instead: (1) lanczos downscale the SR frame (anti-aliased
+                # base), (2) SR-specific detail = SR frame - plain upsample of
+                # the original, (3) downscale that detail too and inject it
+                # back, so the sharpening signal survives the shrink.
+                base = _resize(sr_i.unsqueeze(0), W, H, "disabled")[0]
+                up_ref = _resize(rgb[i].unsqueeze(0), out_w, out_h, "disabled")[0]
+                out[i].copy_(
+                    torch.clamp(
+                        base + float(detail_strength) * (sr_i - up_ref),
+                        0.0, 1.0,
+                    )
+                )
+                del base, up_ref
+            del sr_i
 
-        out = torch.stack(upscaled, dim=0)
-        if (out_w, out_h) != (W, H):
-            out = _resize(out[..., :3].contiguous(), W, H, "disabled")
         out = _temporal_dc_stabilize(out, window=int(window), clip=float(dc_clip))
         return out.to(images.dtype)
     finally:
@@ -491,6 +726,28 @@ def _rtx_vsr_enhance(images, quality="ULTRA", *, window=5, dc_clip=0.03):
 # ---------------------------------------------------------------------------
 # De-fog / de-haze post filter (optional, "evil-cult dehaze" style)
 # ---------------------------------------------------------------------------
+def _unload_comfy_models():
+    """Best-effort: evict the loaded ComfyUI model stack (H3 + VAE) and clear
+    the CUDA cache before the VRAM-hungry RTX VSR post pass.
+
+    Root cause of the 8GB OOM: MiniMax H3 (12.99GB staged) + H3VideoVAE +
+    Krea2T all stayed resident after sampling ("0 models unloaded" in the
+    logs), so the post-pass allocation for a full-clip tensor (4.82GB) had
+    zero free VRAM left. Freeing the model stack first gives the VSR pass
+    several GB to work in. Pure optimization: any failure is ignored.
+    """
+    try:
+        from comfy import model_management
+    except Exception:
+        return False
+    try:
+        model_management.unload_all_models()
+        model_management.soft_empty_cache()
+        return True
+    except Exception:
+        return False
+
+
 def _defog(images, strength: float = 0.5, block: int = 16):
     """Haze-removal look: build an enhanced layer from the frames, then
     hard-light blend it back over the original.
@@ -637,20 +894,77 @@ class H3VisQuasiDLSS5Refiner:
                 "shift_audio": ("FLOAT", {"default": 3.0, "min": 0.0, "max": 30.0, "step": 0.1}),
                 "detect_step": ("INT", {"default": 1, "min": 1, "max": 30, "step": 1}),
                 "full_frame_repair": ("BOOLEAN", {"default": True}),
+                # FaceRefine-style enlarged-crop repair (box-mode, full_frame_repair off)
+                "crop_repair": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Independent of full_frame_repair. FaceRefine-style "
+                        "repair: detected face/hand regions are scaled up onto a "
+                        "larger canvas, regenerated by H3 at high resolution, then "
+                        "warped back with colour matching. Stacks on top of the "
+                        "whole-frame pass when full_frame_repair is also on; with "
+                        "full_frame_repair off it is the sole repair path. Turn "
+                        "off to fall back to the low-res in-place re-generation.",
+                    },
+                ),
+                "crop_canvas": ("INT", {"default": 512, "min": 256, "max": 1440, "step": 32}),
+                "crop_denoise": ("FLOAT", {"default": 0.55, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "colour_match": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.05}),
                 # RTX VSR headless enhancement (applied after repair)
                 "rtx_enhance": (
                     "BOOLEAN",
                     {
                         "default": True,
                         "tooltip": "After the H3 repair (incl. full_frame_repair de-artifact), "
-                        "run a headless NVIDIA RTX Video Super Resolution pass at the SAME "
-                        "multiple (1x, no upscale) to clean/sharp-smooth the whole clip. "
-                        "Requires nvidia-vfx on an RTX GPU; non-fatal if unavailable.",
+                        "run a headless NVIDIA RTX Video Super Resolution pass at the "
+                        "rtx_scale multiple. Requires nvidia-vfx on an RTX GPU; non-fatal "
+                        "if unavailable.",
+                    },
+                ),
+                "rtx_unload_models": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Unload the H3 / VAE model stack and clear the CUDA "
+                        "cache right before the RTX VSR pass, so the VRAM-hungry "
+                        "post-enhancement has room to work on 8GB cards (the OOM root "
+                        "cause was the H3 stack staying resident). Any node that still "
+                        "needs those models downstream will just reload them.",
                     },
                 ),
                 "rtx_quality": (
                     list(RTX_QUALITY_LEVELS),
                     {"default": "ULTRA"},
+                ),
+                "rtx_scale": (
+                    "FLOAT",
+                    {
+                        "default": 1.5, "min": 1.0, "max": 2.0, "step": 0.05,
+                        "tooltip": "RTX VSR upscale factor (1.0 = no enlargement, "
+                        "pure temporal clean at the same resolution).",
+                    },
+                ),
+                "rtx_keep_upscaled": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "False (default): after RTX upscale the clip is shrunk "
+                        "back to the input resolution and the super-res detail is injected "
+                        "back during the shrink -- output size identical to input (fast "
+                        "downstream), sharpness close to the enlarged result. True: output "
+                        "the upscaled resolution directly for max detail (larger output, "
+                        "slower downstream).",
+                    },
+                ),
+                "rtx_detail_strength": (
+                    "FLOAT",
+                    {
+                        "default": 0.85, "min": 0.0, "max": 1.5, "step": 0.05,
+                        "tooltip": "How much of the SR-specific detail (super-res rebuild "
+                        "minus plain upsample) is injected back when shrinking to the "
+                        "input resolution. Only used when rtx_keep_upscaled=False.",
+                    },
                 ),
                 # De-fog / de-haze post look (optional, multiply-blend layer)
                 "defog_enabled": (
@@ -673,11 +987,15 @@ class H3VisQuasiDLSS5Refiner:
     FUNCTION = "run"
     CATEGORY = "H3 Vis Quasi DLSS5"
     DESCRIPTION = (
-        "YOLO-World guided local H3 refine: detection -> prompt definition -> "
+        "YOLO-World guided H3 refine: detection -> prompt definition -> "
         "chunked latent re-generation -> mask paste-back. Fully automatic: "
         "detects the defined classes, injects their names into the fix prompt "
         "({classes} placeholder) and emits the resolved prompt on "
-        "detected_prompt, then rebuilds only the detected regions."
+        "detected_prompt, then rebuilds only the detected regions. "
+        "full_frame_repair (whole-frame de-artifact re-generation) and "
+        "crop_repair (FaceRefine-style: face/hand regions scaled up onto a "
+        "larger canvas, regenerated at high resolution, warped back with "
+        "colour matching) are independent switches and stack when both are on."
     )
 
     # ------------------------------------------------------------------
@@ -689,7 +1007,10 @@ class H3VisQuasiDLSS5Refiner:
             chunk_frames=124, denoise=0.32, steps=4, cfg=1.0, seed=0,
             sampler="euler", scheduler="karras", shift_video=12.0, shift_audio=3.0,
             detect_step=1, full_frame_repair=True,
-            rtx_enhance=True, rtx_quality="ULTRA",
+            crop_repair=True, crop_canvas=512, crop_denoise=0.55, colour_match=0.8,
+            rtx_enhance=True, rtx_unload_models=True,
+            rtx_quality="ULTRA", rtx_scale=1.5,
+            rtx_keep_upscaled=False, rtx_detail_strength=0.85,
             defog_enabled=False, defog_strength=0.5):
         torch = _torch()
         if images is None or images.shape[0] == 0:
@@ -699,29 +1020,37 @@ class H3VisQuasiDLSS5Refiner:
         orig_size = (W, H)
 
         # 1) detection / repair scope
-        if bool(full_frame_repair):
-            # Whole-frame de-artifact repair: skip YOLO, mask covers every pixel.
-            # Targets: material/shading flicker, texture shimmer & tearing, frame
-            # corruption, static-frame damage, random color patches, red/green
-            # bursts, noise blotches, banding streaks.
-            classes = [c.strip() for c in detect_classes.split(",") if c.strip()]
-            if not classes:
-                classes = ["artifacts"]
-            has_boxes = True
-            vid_mask = torch.ones([T, H, W], dtype=torch.float32,
-                                  device=images.device)
-        else:
-            classes = [c.strip() for c in detect_classes.split(",") if c.strip()]
+        # full_frame_repair and crop_repair are independent switches that
+        # stack: whole-frame de-artifact re-generation first (if enabled),
+        # then high-res crop repair of the detected face/hand boxes on top
+        # (if enabled). YOLO only runs when box data is actually needed.
+        classes = [c.strip() for c in detect_classes.split(",") if c.strip()]
+        need_boxes = (not bool(full_frame_repair)) or bool(crop_repair)
+        if need_boxes:
             if not classes:
                 raise ValueError("H3VisQuasiDLSS5Refiner: detect_classes is empty.")
             yolo = _load_yolo(yolov8_weights)
             boxes_list, _, _, _ = _detect_boxes(yolo, images, classes, confidence,
                                                 detect_step)
             has_boxes = any(len(b) > 0 for b in boxes_list)
-            vid_mask = _build_video_mask(
+            box_mask = _build_video_mask(
                 images, boxes_list, dilation=box_dilation, feather=mask_feather,
                 temporal_smooth=temporal_smooth,
             )
+        else:
+            # pure whole-frame mode: no YOLO needed
+            if not classes:
+                classes = ["artifacts"]
+            boxes_list = []
+            has_boxes = True
+            box_mask = None
+
+        did_repair = False
+        if bool(full_frame_repair):
+            frame_mask = torch.ones([T, H, W], dtype=torch.float32,
+                                    device=images.device)
+        else:
+            frame_mask = None
 
         # Same-multiple canvas: keep original resolution, no upscale/downscale.
         # Sample at identical latent resolution; only the prompt changes.
@@ -737,87 +1066,96 @@ class H3VisQuasiDLSS5Refiner:
             fix_prompt = BOX_REPAIR_PROMPT
         prompt = fix_prompt.replace("{classes}", ", ".join(classes))
 
-        # 3) chunked latent re-generation
-        aligned_chunk = _align_frame_count(int(chunk_frames))
-        chunks = []
-        for start in range(0, T, aligned_chunk):
-            chunks.append((start, min(start + aligned_chunk, T)))
-
-        out_frames = []
-        for cidx, (cs, ce) in enumerate(chunks):
-            block_rgb = canvas_images[cs:ce]  # [b,H,W,3], b<= aligned_chunk
-            length = ce - cs
-            aligned_len = _align_frame_count(length)
-
-            # frame-aligned conditioning (keyframes anchor content)
-            first_frame = _resize(block_rgb[:1], canvas_w, canvas_h, "disabled")
-            last_frame = _resize(block_rgb[-1:], canvas_w, canvas_h, "center")
-            positive, template_latent = _build_conditioning(
-                clip, video_vae, prompt, canvas_w, canvas_h, aligned_len,
-                first_frame, last_frame,
+        # 3) chunked latent re-generation. Two independent stages that stack:
+        #    a) whole-frame de-artifact re-generation (full_frame_repair)
+        #    b) FaceRefine-style enlarged-crop repair of detected face/hand
+        #       boxes (crop_repair), applied on top of (a) when both are on.
+        # 3a) whole-frame repair (full_frame_repair, independent of crop_repair)
+        if bool(full_frame_repair):
+            refined_all = _resample_blocks(
+                model, clip, video_vae, canvas_images, canvas_w, canvas_h,
+                prompt, negative_prompt,
+                chunk_frames=chunk_frames, denoise=denoise,
+                steps=steps, cfg=cfg, seed=seed, sampler=sampler,
+                scheduler=scheduler, shift_video=shift_video, shift_audio=shift_audio,
             )
-
-            # pad short tail to aligned grid (repeat last frame)
-            if length != aligned_len:
-                pad_n = aligned_len - length
-                tail = block_rgb[-1:].repeat(pad_n, 1, 1, 1)
-                block_enc = torch.cat([block_rgb, tail], dim=0)
-            else:
-                block_enc = block_rgb
-
-            latent = _encode_block_into_latent(video_vae, block_enc, template_latent)
-
-            # negative: only needed for CFG>1; otherwise pass [] (BasicGuider path)
-            negative = None
-            if float(cfg) > 1.0 and negative_prompt and negative_prompt.strip():
-                negative = clip.encode_from_tokens_scheduled(
-                    clip.tokenize(negative_prompt),
-                )
-
-            sampled = _sample_block(
-                model, positive, negative, latent,
-                seed=seed + cidx, cfg=cfg, steps=steps, denoise=denoise,
-                sampler_name=sampler, scheduler=scheduler,
-                shift_video=shift_video, shift_audio=shift_audio,
-            )
-
-            # decode whole block (may be longer than the chunk tail)
-            sample_dict = (
-                sampled if isinstance(sampled, dict) else {"samples": sampled}
-            )
-            video_latent, _ = _split_video_latent(video_vae, sample_dict)
-            block_out = _decode_video(video_vae, video_latent)
-            out_frames.append(block_out)
-
-        refined_all = torch.cat(out_frames, dim=0)[:T]
-
-        # 4) paste back with per-frame mask (only detected regions replaced)
-        if refined_all.shape[1:3] == (canvas_h, canvas_w):
-            refin_canvas = refined_all
+            if refined_all.shape[1:3] != (canvas_h, canvas_w):
+                refined_all = _resize(refined_all[..., :3].contiguous(),
+                                     canvas_w, canvas_h)
+            result_canvas = _blend(canvas_images, refined_all, frame_mask)
+            did_repair = True
         else:
-            refin_canvas = _resize(refined_all[..., :3].contiguous(), canvas_w, canvas_h)
+            result_canvas = canvas_images
 
-        result_canvas = _blend(canvas_images, refin_canvas, vid_mask)
+        # 3b) FaceRefine-style enlarged-crop repair (face / hand), works on the
+        # result of 3a when full_frame_repair is also on.
+        if bool(crop_repair) and has_boxes and box_mask is not None and any(
+                len(b) > 0 for b in boxes_list):
+            crop_canvas_snap = max(256, int(crop_canvas))
+            crop_video, slot_map, crop_canvas_snap = _build_crop_video(
+                result_canvas, boxes_list, crop_canvas_snap)
+            refined_crops = _resample_blocks(
+                model, clip, video_vae, crop_video,
+                crop_canvas_snap, crop_canvas_snap, prompt, negative_prompt,
+                chunk_frames=chunk_frames, denoise=float(crop_denoise),
+                steps=steps, cfg=cfg, seed=seed, sampler=sampler,
+                scheduler=scheduler, shift_video=shift_video, shift_audio=shift_audio,
+            )
+            # suppress flicker the re-sample can introduce between crop frames
+            refined_crops = _temporal_dc_stabilize(refined_crops, window=5,
+                                                   clip=0.02)
+            result_canvas = _paste_crops_back(
+                result_canvas, refined_crops, slot_map,
+                mask=box_mask, colour_match=colour_match,
+                dilation=int(box_dilation),
+            )
+            did_repair = True
+        elif (not bool(crop_repair) and not bool(full_frame_repair)
+                and has_boxes and box_mask is not None):
+            # legacy in-place box repair (original box-mode behaviour, low denoise)
+            refined_all = _resample_blocks(
+                model, clip, video_vae, canvas_images, canvas_w, canvas_h,
+                prompt, negative_prompt,
+                chunk_frames=chunk_frames, denoise=denoise,
+                steps=steps, cfg=cfg, seed=seed, sampler=sampler,
+                scheduler=scheduler, shift_video=shift_video, shift_audio=shift_audio,
+            )
+            if refined_all.shape[1:3] != (canvas_h, canvas_w):
+                refined_all = _resize(refined_all[..., :3].contiguous(),
+                                     canvas_w, canvas_h)
+            result_canvas = _blend(result_canvas, refined_all, box_mask)
+            did_repair = True
 
+        # 4) project back to original frame size
         if (canvas_w, canvas_h) != orig_size:
             result = _resize(result_canvas[..., :3], W, H)
         else:
             result = result_canvas[..., :3]
 
-        # 5) headless RTX VSR same-multiple enhancement after repair.
-        # Applied to the final repaired clip at 1x (no resolution change, same
-        # latent multiple) to add NVIDIA RTX temporal-super-res cleaning on top
-        # of the H3 de-artifact pass. Fails open when nvvfx/GPU is missing.
+        # 5) headless RTX VSR enhancement after repair. Applied to the final
+        # repaired clip at rtx_scale. keep_upscaled=False (default) shrinks the
+        # super-res clip back to the input resolution while injecting the SR
+        # detail back (detail-preserving downscale: same output size, sharpness
+        # close to the enlarged result). keep_upscaled=True outputs the
+        # enlarged resolution directly for max detail. The H3 stack is evicted
+        # beforehand so the VRAM-hungry pass fits in 8GB. Fails open when
+        # nvvfx/GPU is missing.
         if bool(rtx_enhance):
-            result = _rtx_vsr_enhance(result, str(rtx_quality))
+            if bool(rtx_unload_models):
+                _unload_comfy_models()
+            result = _rtx_vsr_enhance(
+                result, str(rtx_quality), scale=float(rtx_scale),
+                keep_upscaled=bool(rtx_keep_upscaled),
+                detail_strength=float(rtx_detail_strength),
+            )
 
         # 6) optional de-fog / de-haze look (multiply-blend enhanced layer).
         if bool(defog_enabled):
             result = _defog(result, float(defog_strength))
 
         keep = result.to(images.dtype)
-        if has_boxes or bool(rtx_enhance) or bool(defog_enabled):
+        if did_repair or bool(rtx_enhance) or bool(defog_enabled):
             return (keep, prompt)
-        # no detection & no repair/enhance pass active: return input unchanged
+        # no repair/enhance pass active: return input unchanged
         return (images, prompt)
 

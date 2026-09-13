@@ -22,7 +22,10 @@ YOLO-World 引导的 MiniMax H3 视频**局部修复（Refine）**节点
 - **双模式**：
   - `full_frame_repair = true`：全帧去伪影（纹理闪烁/撕裂、色带、坏帧、色块、噪点等），跳过 YOLO。
   - `full_frame_repair = false`：盒级局部修复，YOLO 检测 → 类名注入修复 Prompt。
-- **Headless RTX VSR**（可选）：内置 `nvvfx` 同倍率（1x，不放大）RTX Video Super Resolution 清理 + 时域 DC 稳定，失败自动降级放行，不影响 H3 修复结果。
+- **Headless RTX VSR**（可选）：内置 `nvvfx` RTX Video Super Resolution（1.0~2.0x 超分）清理 + 时域 DC 稳定，失败自动降级放行，不影响 H3 修复结果。支持两种输出策略：
+  - **细节注入式缩回**（默认，`rtx_keep_upscaled=false`）：超分放大后缩回输入分辨率，同时把超分重建的细节残差注入回去（detail-preserving downscale）——输出尺寸不变、下游零额外开销，锐度贴近放大版；
+  - **直接输出放大分辨率**（`rtx_keep_upscaled=true`）：保留超分后的大分辨率，细节最大化、下游更慢。
+  - RTX 后处理前自动卸载 H3 模型栈并清缓存（`rtx_unload_models`），8GB 显存友好。
 - **检测加速**：`detect_step > 1` 时只对采样帧推理，中间帧复用最近一帧的检测框，配合时间 Mask 平滑容忍误差。
 - **自包含**：检测、潜空间注入、条件构建、采样、回贴全部基于 ComfyUI 官方核心（`comfy_extras.nodes_minimax_h3` 等）实现。
 - 
@@ -104,6 +107,15 @@ YOLO-World 引导的 MiniMax H3 视频**局部修复（Refine）**节点
 ## 兼容性
 
 - 需要 ComfyUI 已提供 MiniMax H3 官方节点支持（`comfy_extras.nodes_minimax_h3`）。
+
+## 更新日志
+
+### 2026-09-13 — RTX 显存优化 + 超分细节保留
+
+- **修复 8GB 显存 OOM**：RTX VSR 后处理改为**逐帧流式**写入（移除原先收集全部放大帧后 `stack` 的双份完整放大片段），峰值显存降低约一半，且与视频帧数解耦；
+- **DC 稳定分块化**：时域 DC 平滑改为分块 in-place 修正，去除全批 `float + clone + clamp` 三重复制，进一步压低后处理峰值；
+- **新增 `rtx_unload_models`（默认开）**：RTX 后处理前卸载 H3/VAE 模型栈并软清 CUDA 缓存，根治"H3 权重常驻导致后处理无显存可用"的 OOM 根因；后续节点如需模型会自动重新加载；
+- **新增 `rtx_keep_upscaled` / `rtx_detail_strength`**：超分详情保留策略升级为「细节注入式缩回」——在缩回输入分辨率的同时把超分重建的细节残差注入回去（detail-preserving downscale），输出尺寸不变、下游零额外开销，锐度贴近放大版；也可以保持原方案直接输出放大分辨率（`rtx_keep_upscaled=true`）。
 
 ## License
 
