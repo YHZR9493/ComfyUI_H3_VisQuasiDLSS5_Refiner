@@ -1,13 +1,13 @@
-"""ComfyUI H3 Vis Quasi DLSS5 Refiner — standalone YOLO-World guided H3 refine.
+"""ComfyUI H3 Vis Quasi DLSS5 Refiner — headless RTX VSR / DLSS SR enhancer.
 
-Moved out of ComfyUI_MiniMaxH3_Director as an independent node package
-(functionality unchanged). Detects open-vocabulary classes with YOLO-World,
-injects the class names into a repair prompt, re-generates only the detected
-regions with MiniMax H3 in temporal chunks and blends them back; optionally
-follows up with a headless same-multiple NVIDIA RTX VSR pass.
+Enhancement-only node for MiniMax H3 video pipelines: the input clip flows
+straight through an NVIDIA super-resolution bridge (true DLSS SR preferred,
+nvvfx RTX VSR fallback) at rtx_scale, optionally applies DLSS 5 Neural
+Rendering after the SR rebuild, then an optional de-fog / de-haze post look.
+YOLO-guided detection and H3 re-generation repair were removed.
 
 Standalone: only depends on ComfyUI official core (comfy / comfy_extras /
-nodes), ultralytics and nvvfx — no Director dependency.
+nodes) and optional NVIDIA runtimes; falls back open when unavailable.
 """
 
 from .nodes.h3_vis_quasi_dlss5_refiner import H3VisQuasiDLSS5Refiner

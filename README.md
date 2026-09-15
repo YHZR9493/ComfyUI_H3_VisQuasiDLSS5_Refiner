@@ -1,34 +1,25 @@
 # ComfyUI_H3_VisQuasiDLSS5_Refiner
 
 ![ComfyUI](https://img.shields.io/badge/ComfyUI-✓-orange) ![MiniMax_H3](https://img.shields.io/badge/MiniMax%20H3-✓-blue) ![License](https://img.shields.io/badge/License-Apache--2.0-green)
+
 ## 完整说明
 
-H3 Vis Quasi-DLSS5 Refiner 是一款面向 MiniMax H3 视频生成管线的修复增强节点。它借鉴 GPU 实时超分（如 DLSS）"以重生成代替直出"的思路，将二次采样技术落地为视频级画质修复：不追求像素级重建，而是让模型对目标区域做低强度潜空间重生成（re-generate）——以较低的 denoise 对画面进行二次采样，让模型在原有结构基础上"重新画一遍"，在回收伪影、抹除瑕疵的同时补回细节，实现近似超分 / 修复的观感提升。
+H3 Vis Quasi-DLSS5 Refiner 是一款面向 MiniMax H3 视频生成管线的**无头超分增强节点**。它把 NVIDIA 超分重建（真 DLSS SR / RTX VSR）直接应用在输入画面上，按 `rtx_scale` 放大并重建细节，可选在放大帧上追加 DLSS 5 Neural Rendering 外观，再叠加可选的去雾（de-fog / de-haze）后期外观。
 
-因这种"低 denoise 重生成模拟超分增强"的运作逻辑与 DLSS 的"重建优于渲染"理念一脉相承，故命名为 Quasi-DLSS5——"类似 DLSS5"，而非真实的深度学习超分辨率。
-
-核心流程：开放词汇目标检测（YOLO-World）→ Prompt 注入 → 分块潜空间重生成 → Mask 羽化回贴，整条链路自动完成，用户只需指定要修复的目标和强度。
-
-YOLO-World 引导的 MiniMax H3 视频**局部修复（Refine）**节点 
-
-检测 → Prompt 定义 → 分块潜空间重生成 → Mask 羽化回贴，整条管线收敛在**单个节点**内完成，不改动检测区域之外的任何像素。
+相比依赖 H3 二次采样的旧版（YOLO 目标检测 + 潜空间局部重生成 + Mask 回贴），当前版本**移除了全部检测 / 修复 / 回贴链路**，只保留"增强直通"一条路径：输入视频帧 → NVIDIA 超分桥（DLSS5 后端优先，nvvfx RTX VSR 兜底）→（可选）DLSS 5 NR →（可选）去雾，输出增强后的画面。
 
 ## 特性
 
-- **开放词汇目标检测**：YOLO-World（`yolov8s-world.pt` / `yolov8l-world.pt`），不限定类别，`detect_classes` 逗号分隔任意类名（face、hand、text、logo…）。
-- **自动 Prompt 注入**：检测到的类名自动替换 `fix_prompt` 中的 `{classes}` 占位符，并通过 `detected_prompt` 输出口导出实际使用的完整提示词。
-- **像素级保留**：Mask 羽化 + 时间平滑，只重生成检测区域；未检测区域逐像素保持原图（Paste-back 由 per-frame mask 加权）。
-- **分块时空重生成**：帧数自动对齐 H3 网格（`_align_frame_count`，`n % 17 == 5`），长视频按时序分块（`chunk_frames`）逐块采样，控制显存峰值。
-- **双模式**：
-  - `full_frame_repair = true`：全帧去伪影（纹理闪烁/撕裂、色带、坏帧、色块、噪点等），跳过 YOLO。
-  - `full_frame_repair = false`：盒级局部修复，YOLO 检测 → 类名注入修复 Prompt。
-- **Headless RTX VSR**（可选）：内置 `nvvfx` RTX Video Super Resolution（1.0~2.0x 超分）清理 + 时域 DC 稳定，失败自动降级放行，不影响 H3 修复结果。支持两种输出策略：
-  - **细节注入式缩回**（默认，`rtx_keep_upscaled=false`）：超分放大后缩回输入分辨率，同时把超分重建的细节残差注入回去（detail-preserving downscale）——输出尺寸不变、下游零额外开销，锐度贴近放大版；
-  - **直接输出放大分辨率**（`rtx_keep_upscaled=true`）：保留超分后的大分辨率，细节最大化、下游更慢。
-  - RTX 后处理前自动卸载 H3 模型栈并清缓存（`rtx_unload_models`），8GB 显存友好。
-- **检测加速**：`detect_step > 1` 时只对采样帧推理，中间帧复用最近一帧的检测框，配合时间 Mask 平滑容忍误差。
-- **自包含**：检测、潜空间注入、条件构建、采样、回贴全部基于 ComfyUI 官方核心（`comfy_extras.nodes_minimax_h3` 等）实现。
-- 
+- **无头超分增强**：`rtx_enhance` 开启后运行 NVIDIA RTX Video Super Resolution / DLSS SR（`rtx_scale` 1.0~2.0x），不可用时自动跳过，不影响主流程。
+- **DLSS5 后端优先**：`rtx_backend=auto` 时存在真 DLSS SR（vsdlsssr.dll）则走 DLSS SR，否则退回 nvvfx RTX VSR；也可强制 `dlss5` / `nvvfx`。
+- **DLSS 5 Neural Rendering**（可选）：`dlss_nr_mode` 在 SR 重建后的放大帧上施加 NR 外观（Off / Neutral / faithful / Realistic detail / Strong detail），`dlss_nr_intensity` 调节强度。NR 在独立进程运行，几乎不占 torch 显存。
+- **深度 + 光流引导**：DLSS SR 使用 Depth Anything V2（`dlss_depth_model`）与 RAFT 光流（`dlss_motion_model`）做引导，权重首次使用时自动下载；`dlss_motion_scale=0.5` 半分辨率估光流提速约 4 倍。
+- **两种输出策略**：
+  - `rtx_keep_upscaled=true`（默认）：直接输出放大后的分辨率，细节最大化；
+  - `rtx_keep_upscaled=false`：放大后缩回原分辨率，并把超分重建的细节残差按 `rtx_detail_strength` 回注（输出尺寸不变、下游更快）。
+- **显存友好**：`rtx_unload_models`（默认开）在超分前卸载 H3/VAE 模型栈并清缓存，解决 8GB 显存 OOM 根因；深度/光流/NR 均支持帧批控制（`dlss_chunk_frames` / `dlss_nr_chunk_frames`），NR 超过 2M 像素自动限制批大小。
+- **去雾外观**（可选）：`defog_enabled` 对画面做提亮 + 减辉光 + 锐化 + 提阴影的增强层，再乘性混合回画面，用于雾感 / 灰蒙画面。
+- **自包含**：除 ComfyUI 官方核心外，仅依赖可选的 NVIDIA 运行时（缺失时自动降级放行）。
 
 ## 安装
 
@@ -37,12 +28,11 @@ YOLO-World 引导的 MiniMax H3 视频**局部修复（Refine）**节点
    cd <ComfyUI>/custom_nodes
    git clone https://github.com/YHZR9493/ComfyUI_H3_VisQuasiDLSS5_Refiner.git
    ```
-2. 安装 Python 依赖：
+2. 安装可选 Python 依赖（DLSS5 后端需要，RTX GPU + 对应运行时）：
    ```bash
-   pip install ultralytics
-   # 可选（RTX VSR 增强需要，RTX GPU + 官方 nvidia-vfx）：
    pip install nvvfx
    ```
+   DLSS5 桥（`dlss5_bridge.py`）会复用相邻的 `ComfyUI-DLSS5` 包及其隔离运行环境（vsdlssnr.dll / vsdlsssr.dll / bridge_runner.py），缺失时自动降级到 nvvfx 或跳过。
 3. 重启 ComfyUI。
 
 节点位于分类 **`H3 Vis Quasi DLSS5`** 下。
@@ -54,23 +44,15 @@ YOLO-World 引导的 MiniMax H3 视频**局部修复（Refine）**节点
 | 主模型 | **MiniMax H3（ref2va）UNet** | 如 `minimax_h3_ref2va_int8_convrot.safetensors` 等，接入 `MODEL` |
 | 视频 VAE | **MiniMax H3 Video VAE** | `minimax_h3_video_vae_fp16.safetensors`，接入 `video_vae` |
 | 文本 | **MiniMax H3 CLIP** | `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` 等，接入 `clip` |
-| 检测 | **YOLO-World 权重** | `yolov8s-world.pt` / `yolov8l-world.pt`，本地路径填到 `yolov8_weights` |
-
-> 注意：`yolov8_weights` 默认值为作者本机路径，使用前请改为你本机的权重绝对路径。
+| 深度引导 | **Depth Anything V2** | `dlss_depth_model=Small/Base/Large`，首次使用自动下载 |
+| 光流引导 | **RAFT** | `dlss_motion_model=Small/Large`，首次使用自动下载 |
 
 ## 依赖的其他节点 / 运行库
 
-该节点是**自包含**的，不依赖第三方节点包，仅依赖：
-
-- **ComfyUI 官方核心模块**（随 ComfyUI 自带，无需额外安装）：
-  - `comfy_extras.nodes_minimax_h3` — `MiniMaxH3ImageToVideo`（条件+空 AV latent 模板）、`MiniMaxH3SigmaShift`
-  - `comfy_extras.nodes_custom_sampler` — `BasicGuider` / `CFGGuider` / `BasicScheduler` / `KSamplerSelect` / `RandomNoise` / `SamplerCustomAdvanced`
-  - `comfy_extras.nodes_lt` — `LTXVSeparateAVLatent`
-  - `nodes` — `VAEDecode`
-  - `comfy.nested_tensor`、`comfy.utils`
+- **ComfyUI 官方核心模块**（随 ComfyUI 自带）：`comfy.utils`、`comfy.model_management` 等。
 - **PyTorch / ComfyUI 自带 torch**。
-- **ultralytics**（YOLO-World，必需，懒加载）。
-- **nvvfx**（可选，仅 `rtx_enhance` 开启时使用，失败自动跳过）。
+- **nvvfx**（可选，仅 nvvfx 后端使用，失败自动跳过）。
+- **ComfyUI-DLSS5 包**（可选，DLSS5 SR / NR 后端）：节点桥自动发现相邻 `custom_nodes/ComfyUI-DLSS5`，缺失时降级到 nvvfx 或跳过。
 
 ## 使用方法
 
@@ -79,43 +61,53 @@ YOLO-World 引导的 MiniMax H3 视频**局部修复（Refine）**节点
 | 接口 | 类型 | 必填 | 说明 |
 |---|---|---|---|
 | `images` | IMAGE | ✔ | 输入视频帧序列 `[T,H,W,C]` |
-| `model` | MODEL | ✔ | MiniMax H3 模型 |
-| `video_vae` | VAE | ✔ | MiniMax H3 视频 VAE |
-| `clip` | CLIP | ✔ | MiniMax H3 文本编码器 |
+| `model` | MODEL | ✔ | MiniMax H3 模型（兼容旧工作流保留） |
+| `video_vae` | VAE | ✔ | MiniMax H3 视频 VAE（兼容旧工作流保留） |
+| `clip` | CLIP | ✔ | MiniMax H3 文本编码器（兼容旧工作流保留） |
 
-### 可选参数（节选）
+### 可选参数
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `full_frame_repair` | true | true=全帧去伪影；false=YOLO 盒级局部修复 |
-| `detect_classes` | `face, hand` | 盒级模式的目标类名（逗号分隔开放词汇） |
-| `fix_prompt` | 去伪影 Prompt | 修复 Prompt，`{classes}` 会被替换 |
-| `confidence` | 0.25 | YOLO 置信度阈值 |
-| `box_dilation` / `mask_feather` | 12 / 6 | 检测框膨胀 / Mask 羽化半径 |
-| `temporal_smooth` | 3 | Mask 时间平滑窗口 |
-| `chunk_frames` | 124 | 分块采样帧数（自动对齐 H3 网格） |
-| `denoise` / `steps` / `cfg` | 0.32 / 4 / 1.0 | 采样参数 |
-| `rtx_enhance` / `rtx_quality` | true / ULTRA | 可选 headless RTX VSR 增强 |
+| `rtx_enhance` | true | 无头 RTX VSR / DLSS SR 超分增强总开关 |
+| `rtx_unload_models` | true | 超分前卸载 H3 模型栈并清缓存（8GB 显存友好） |
+| `rtx_quality` | ULTRA | RTX 超分质量档位 LOW/MEDIUM/HIGH/ULTRA |
+| `rtx_scale` | 1.5 | 超分放大倍率（1.0~2.0） |
+| `rtx_keep_upscaled` | true | true=直接输出放大分辨率；false=缩回原分辨率并回注细节 |
+| `rtx_backend` | auto | 增强引擎：auto / dlss5 / nvvfx |
+| `dlss_quality` | Quality | DLSS SR 质量预设（Quality/Balanced/Performance/Ultra Performance/Ultra Quality/DLAA） |
+| `dlss_depth_model` | Small | 深度引导模型（Small/Base/Large） |
+| `dlss_motion_model` | Small | 光流引导模型（Small/Large） |
+| `dlss_chunk_frames` | 4 | 深度/光流引导推理帧批大小（1~32） |
+| `dlss_motion_scale` | 0.5 | RAFT 光流分辨率比例（0.5 半分辨率约快 4 倍） |
+| `dlss_nr_mode` | Off | DLSS 5 Neural Rendering 外观（Off/Neutral / faithful/Realistic detail/Strong detail） |
+| `dlss_nr_intensity` | 1.0 | NR 效果强度倍率（0.0~1.5） |
+| `dlss_nr_chunk_frames` | 4 | NR 进程帧批大小（1~16，超 2M 像素自动限 2） |
+| `rtx_detail_strength` | 0.85 | 缩回原分辨率时 SR 细节回注强度（仅 keep_upscaled=false） |
+| `defog_enabled` | false | 去雾后期外观开关 |
+| `defog_strength` | 0.5 | 去雾强度（0.0~1.0） |
 
 ### 输出
 
 | 输出 | 类型 | 说明 |
 |---|---|---|
-| `images` | IMAGE | 修复后的帧序列 |
-| `detected_prompt` | STRING | 实际使用（已注入类名）的完整修复 Prompt |
+| `images` | IMAGE | 增强后的帧序列 |
+| `detected_prompt` | STRING | 运行状态说明（"RTX/DLSS/defog enhanced" 或 "no enhancement applied"） |
 
 ## 兼容性
 
-- 需要 ComfyUI 已提供 MiniMax H3 官方节点支持（`comfy_extras.nodes_minimax_h3`）。
+- 需要 NVIDIA RTX 显卡（RTX VSR / DLSS 运行时）。无 NVIDIA 运行时或缺失 DLL 时节点**失败自动放行**，原样返回输入，不中断工作流。
+- `model` / `video_vae` / `clip` 仅保留以兼容旧工作流，当前版本不参与推理。
 
 ## 更新日志
 
-### 2026-09-13 — RTX 显存优化 + 超分细节保留
+### 2026-09-15 — 精简为纯超分增强节点（v2）
 
-- **修复 8GB 显存 OOM**：RTX VSR 后处理改为**逐帧流式**写入（移除原先收集全部放大帧后 `stack` 的双份完整放大片段），峰值显存降低约一半，且与视频帧数解耦；
-- **DC 稳定分块化**：时域 DC 平滑改为分块 in-place 修正，去除全批 `float + clone + clamp` 三重复制，进一步压低后处理峰值；
-- **新增 `rtx_unload_models`（默认开）**：RTX 后处理前卸载 H3/VAE 模型栈并软清 CUDA 缓存，根治"H3 权重常驻导致后处理无显存可用"的 OOM 根因；后续节点如需模型会自动重新加载；
-- **新增 `rtx_keep_upscaled` / `rtx_detail_strength`**：超分详情保留策略升级为「细节注入式缩回」——在缩回输入分辨率的同时把超分重建的细节残差注入回去（detail-preserving downscale），输出尺寸不变、下游零额外开销，锐度贴近放大版；也可以保持原方案直接输出放大分辨率（`rtx_keep_upscaled=true`）。
+- **移除**：YOLO-World 目标检测、自动 Prompt 注入、分块潜空间重生成、Mask 羽化回贴、全帧去伪影等全部修复链路（旧辅助函数、常量一并删除，节点文件 1374 行 → 609 行）；
+- **保留并强化**：headless RTX VSR / DLSS SR 超分增强 + 时域 DC 稳定 + 细节注入式缩回；
+- **新增 DLSS5 桥**：`dlss5_bridge.py` 接入真 DLSS SR 与 DLSS 5 Neural Rendering（深度/光流引导、独立进程 NR）；
+- **新增去雾外观**：`defog_enabled` / `defog_strength` 乘性混合去雾后期；
+- 参数精简为 17 项，与 INPUT_TYPES / run 签名完全一致。
 
 ## License
 
