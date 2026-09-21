@@ -1,11 +1,12 @@
 """H3VisQuasiDLSS5Refiner - headless RTX VSR / DLSS SR enhancement node.
 
 Single-node pipeline: input clip -> (optional model unload) -> NVIDIA
-super-resolution enhancement (DLSS5 backend preferred via in-process
-VapourSynth bridge, nvvfx RTX VSR fallback) -> optional de-fog / de-haze
-post look. YOLO-World guided detection, chunked latent re-generation and
-mask-feathered paste-back repair were removed; only the rtx_*/dlss_*/defog_*
-enhancement chain remains.
+enhancement (DLSS5-native backend preferred: the sibling
+ComfyUI-DLSS5-Enhancer native feature-18 neural-rendering worker reused on the
+frame stream, then in-process VapourSynth DLSS SR bridge, then nvvfx RTX VSR
+fallback) -> optional de-fog / de-haze post look. YOLO-World guided detection,
+chunked latent re-generation and mask-feathered paste-back repair were
+removed; only the rtx_*/dlss_*/defog_* enhancement chain remains.
 
 Interface: 4 inputs (model / video_vae / clip / images) -> 1 output (images).
 No audio_vae, no audio output, no reference-image groups.
@@ -43,13 +44,40 @@ except Exception:  # noqa: BLE001 - ComfyUI may load this file without package c
         _dlss5_available = None
         _dlss5_upscale = None
 
+# ---------------------------------------------------------------------------
+# True NVIDIA DLSS 5 Neural Rendering (Feature 18) bridge.
+# Reuses the sibling ComfyUI-DLSS5-Enhancer package (DlssSession + TemporalGuide)
+# so the refiner applies the exact same DLSS5 enhancement as the DLSS5-Enhancer
+# nodes on the frame stream. Optional: absent / broken -> skip.
+# ---------------------------------------------------------------------------
+try:
+    from .dlss5_native import dlss5_native_available as _dlss5_native_available
+    from .dlss5_native import dlss5_native_enhance as _dlss5_native_enhance
+except Exception:  # noqa: BLE001
+    try:
+        from dlss5_native import dlss5_native_available as _dlss5_native_available
+        from dlss5_native import dlss5_native_enhance as _dlss5_native_enhance
+    except Exception:  # noqa: BLE001
+        _dlss5_native_available = None
+        _dlss5_native_enhance = None
+
 DLSS5_QUALITY_LEVELS = ("Quality", "Balanced", "Performance",
                         "Ultra Performance", "Ultra Quality", "DLAA")
 DLSS5_DEPTH_MODELS = ("Small", "Base", "Large")
 DLSS5_MOTION_MODELS = ("Small", "Large")
 DLSS5_NR_MODES = ("Off", "Neutral / faithful", "Realistic detail",
                   "Strong detail")
-RTX_BACKENDS = ("auto", "dlss5", "nvvfx")
+# Native DLSS5 (feature-18 worker) controls, mirroring the DLSS5-Enhancer
+# Settings node: upscaling factor, neural-rendering appearance and guides.
+DLSS5_NATIVE_UPSCALING_LABELS = (
+    "1x (DLAA / native)", "1.5x (Quality)", "1.724x (Balanced)",
+    "2x (Performance)", "3x (Ultra Performance)",
+)
+DLSS5_NATIVE_NR_PRESETS = ("Default", "Preset #1", "Preset #2", "Preset #3")
+DLSS5_NATIVE_NR_STYLES = ("Default", "Natural", "Cinematic")
+DLSS5_NATIVE_MODEL_PRESETS = ("Default", "J", "K", "L", "M")
+DLSS5_NATIVE_MOTION_MODES = ("auto", "optical_flow", "none")
+RTX_BACKENDS = ("auto", "dlss5-native", "dlss5", "nvvfx")
 
 
 def _resize(images, width: int, height: int, crop="center"):
@@ -130,10 +158,27 @@ def _rtx_vsr_enhance(images, quality="ULTRA", *, scale=1.5, keep_upscaled=False,
                      dlss_depth_model="Small", dlss_motion_model="Small",
                      dlss_chunk_frames=4,
                      dlss_nr_mode="Off", dlss_nr_intensity=1.0,
-                     dlss_nr_chunk_frames=4, dlss_motion_scale=0.5):
+                     dlss_nr_chunk_frames=4, dlss_motion_scale=0.5,
+                     dlss5_upscaling_mode="1.5x (Quality)",
+                     dlss5_nr_preset="Default", dlss5_nr_style="Default",
+                     dlss5_nr_intensity=1.0,
+                     dlss5_local_tone_strength=1.0,
+                     dlss5_local_structure_strength=1.5,
+                     dlss5_skin_structure_strength=2.0,
+                     dlss5_automatic_mask=True, dlss5_model_preset="M",
+                     dlss5_motion="auto", dlss5_scene_change_threshold=0.24,
+                     dlss5_warmup_frames=0, dlss5_flow_width=640,
+                     dlss5_runtime_dir="", dlss5_verify_neural_rendering=True):
     """Headless NVIDIA super-resolution enhancement.
 
-    Two backends, selected by `backend` ("auto" prefers the true DLSS bridge):
+    Three backends, selected by `backend` ("auto" prefers the true DLSS
+    bridges in order: dlss5-native -> dlss5 -> nvvfx):
+      * dlss5-native - true NVIDIA DLSS 5 Neural Rendering (Feature 18). The
+        sibling ComfyUI-DLSS5-Enhancer package is reused as-is: a native
+        nvngx.dll worker (DlssSession) renders every frame through the signed
+        DLSSNR feature-18 pipeline with DIS optical-flow temporal guidance
+        (TemporalGuide). This is exactly the enhancement the DLSS5-Enhancer
+        nodes apply, now on the refiner's images stream.
       * dlss5  - official NVIDIA DLSS Super Resolution (vsdlsssr.dll +
         nvngx_dlss.dll) through the in-process VapourSynth bridge, with
         Depth Anything V2 + RAFT guides estimated inside the node. When
@@ -143,7 +188,7 @@ def _rtx_vsr_enhance(images, quality="ULTRA", *, scale=1.5, keep_upscaled=False,
         SR -> NR on the enlarged frame, guides resized to match.
       * nvvfx  - headless NVIDIA RTX Video Super Resolution (nvvfx package).
 
-    Behaviour of the result (both backends):
+    Behaviour of the result (all backends):
       * keep_upscaled=True  -> the enlarged clip is output at the upscaled
         resolution (max detail, larger output, slower downstream).
       * keep_upscaled=False -> the enlarged super-res clip is shrunk back to
@@ -156,6 +201,39 @@ def _rtx_vsr_enhance(images, quality="ULTRA", *, scale=1.5, keep_upscaled=False,
     A light temporal DC smoothing kills per-frame flicker. Fully in-node;
     any runtime / GPU issue is non-fatal and passes the input through.
     """
+    # ---- DLSS5-native backend: true NVIDIA DLSS 5 Neural Rendering ---------
+    use_native = (backend == "dlss5-native") or (
+        backend == "auto"
+        and _dlss5_native_available is not None
+        and _dlss5_native_available()
+    )
+    if use_native and _dlss5_native_enhance is not None:
+        try:
+            out = _dlss5_native_enhance(
+                images,
+                upscaling_mode=str(dlss5_upscaling_mode),
+                nr_preset=str(dlss5_nr_preset),
+                nr_style=str(dlss5_nr_style),
+                nr_intensity=float(dlss5_nr_intensity),
+                local_tone_strength=float(dlss5_local_tone_strength),
+                local_structure_strength=float(dlss5_local_structure_strength),
+                skin_structure_strength=float(dlss5_skin_structure_strength),
+                automatic_mask=bool(dlss5_automatic_mask),
+                dlss_model_preset=str(dlss5_model_preset),
+                motion_mode=str(dlss5_motion),
+                scene_change_threshold=float(dlss5_scene_change_threshold),
+                warmup_frames=int(dlss5_warmup_frames),
+                flow_width=int(dlss5_flow_width),
+                runtime_dir=str(dlss5_runtime_dir),
+                keep_upscaled=bool(keep_upscaled),
+                detail_strength=float(detail_strength),
+                verify_neural_rendering=bool(dlss5_verify_neural_rendering),
+            )
+            if out is not None:
+                return out.to(images.device).to(images.dtype)
+        except Exception:  # noqa: BLE001 - fail open to dlss5 / nvvfx
+            pass
+
     # ---- DLSS5 backend: true NVIDIA DLSS SR (in-process VapourSynth) -----
     use_dlss = (backend == "dlss5") or (
         backend == "auto"
@@ -478,6 +556,122 @@ class H3VisQuasiDLSS5Refiner:
                         "推荐值：0.5。",
                     },
                 ),
+                # ---- Native DLSS5 (Feature 18) controls -------------------
+                # Applied when rtx_backend = dlss5-native (or auto with the
+                # ComfyUI-DLSS5-Enhancer runtime present). Mirrors the
+                # DLSS5-Enhancer Settings node controls 1:1.
+                "dlss5_upscaling_mode": (
+                    DLSS5_NATIVE_UPSCALING_LABELS,
+                    {
+                        "default": "1.5x (Quality)",
+                        "tooltip": "DLSS5 原生神经渲染的超分档位（DLAA/1.5x/1.724x/2x/3x）。"
+                        "仅 dlss5-native 后端生效。\n"
+                        "推荐值：1.5x (Quality)；与 rtx_scale=1.5 对齐。",
+                    },
+                ),
+                "dlss5_nr_preset": (
+                    DLSS5_NATIVE_NR_PRESETS,
+                    {
+                        "default": "Default",
+                        "tooltip": "DLSS5 神经渲染预设（Default/Preset #1~#3）。"
+                        "仅 dlss5-native 后端生效。\n推荐值：Default。",
+                    },
+                ),
+                "dlss5_nr_style": (
+                    DLSS5_NATIVE_NR_STYLES,
+                    {
+                        "default": "Default",
+                        "tooltip": "DLSS5 神经渲染外观风格（Default/Natural/Cinematic）。"
+                        "仅 dlss5-native 后端生效。\n推荐值：Default；电影感可试 Cinematic。",
+                    },
+                ),
+                "dlss5_nr_intensity": (
+                    "FLOAT",
+                    {
+                        "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
+                        "tooltip": "DLSS5 神经渲染整体强度倍率。"
+                        "1.0 = 所选外观的原生强度；<1 更柔和，>1 更强烈。"
+                        "仅 dlss5-native 后端生效。\n推荐值：1.0。",
+                    },
+                ),
+                "dlss5_local_tone_strength": (
+                    "FLOAT",
+                    {
+                        "default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
+                        "tooltip": "DLSS5 局部色调强度。仅 dlss5-native 后端生效。\n推荐值：1.0。",
+                    },
+                ),
+                "dlss5_local_structure_strength": (
+                    "FLOAT",
+                    {
+                        "default": 1.5, "min": 0.0, "max": 2.0, "step": 0.05,
+                        "tooltip": "DLSS5 局部结构强度。仅 dlss5-native 后端生效。\n推荐值：1.5。",
+                    },
+                ),
+                "dlss5_skin_structure_strength": (
+                    "FLOAT",
+                    {
+                        "default": 2.0, "min": -1.0, "max": 2.0, "step": 0.05,
+                        "tooltip": "DLSS5 皮肤结构强度（可为负）。仅 dlss5-native 后端生效。\n推荐值：2.0。",
+                    },
+                ),
+                "dlss5_automatic_mask": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "DLSS5 自动掩码（面部保护等）。仅 dlss5-native 后端生效。\n推荐值：True。",
+                    },
+                ),
+                "dlss5_model_preset": (
+                    DLSS5_NATIVE_MODEL_PRESETS,
+                    {
+                        "default": "M",
+                        "tooltip": "DLSS5 模型预设（Default/J/K/L/M）。M 为当前驱动默认模型；"
+                        "若运行时报模型不支持，改回 Default。仅 dlss5-native 后端生效。\n推荐值：M。",
+                    },
+                ),
+                "dlss5_motion": (
+                    DLSS5_NATIVE_MOTION_MODES,
+                    {
+                        "default": "auto",
+                        "tooltip": "DLSS5 运动引导模式：auto（多帧时自动启用 DIS 光流）、"
+                        "optical_flow（强制光流）、none（单帧独立处理）。"
+                        "仅 dlss5-native 后端生效。\n推荐值：auto。",
+                    },
+                ),
+                "dlss5_scene_change_threshold": (
+                    "FLOAT",
+                    {
+                        "default": 0.24, "min": 0.01, "max": 1.0, "step": 0.01,
+                        "tooltip": "DLSS5 场景切换阈值：光流异常时重置时序累积。"
+                        "仅 dlss5-native 后端生效。\n推荐值：0.24。",
+                    },
+                ),
+                "dlss5_warmup_frames": (
+                    "INT",
+                    {
+                        "default": 0, "min": 0, "max": 16,
+                        "tooltip": "DLSS5 预热帧数（前 N 帧不输出、用于稳定时序）。"
+                        "仅 dlss5-native 后端生效。\n推荐值：0。",
+                    },
+                ),
+                "dlss5_flow_width": (
+                    "INT",
+                    {
+                        "default": 640, "min": 64, "max": 4096,
+                        "tooltip": "DLSS5 光流计算宽度（分辨率比例）。"
+                        "仅 dlss5-native 后端生效。\n推荐值：640。",
+                    },
+                ),
+                "dlss5_verify_neural_rendering": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "渲染完成后校验 ReShade 日志确认 Feature-18 真正执行；"
+                        "若未执行（如仅超分）则视为失败回退到 dlss5/nvvfx 后端。"
+                        "仅 dlss5-native 后端生效。\n推荐值：True。",
+                    },
+                ),
                 "dlss_nr_mode": (
                     DLSS5_NR_MODES,
                     {
@@ -539,12 +733,14 @@ class H3VisQuasiDLSS5Refiner:
     FUNCTION = "run"
     CATEGORY = "H3 Vis Quasi DLSS5"
     DESCRIPTION = (
-        "Headless RTX VSR / DLSS SR enhancement plus optional de-fog look "
+        "Headless RTX VSR / DLSS5 enhancement plus optional de-fog look "
         "for MiniMax H3 videos. The input clip is passed straight through "
-        "the NVIDIA super-resolution bridge (DLSS5 backend preferred, "
-        "nvvfx RTX VSR fallback) at rtx_scale, with an optional de-fog / "
-        "de-haze multiply-blend layer applied afterwards. YOLO-guided "
-        "detection and H3 re-generation repair were removed."
+        "the DLSS5 pipeline (dlss5-native Feature 18 neural rendering "
+        "preferred when the ComfyUI-DLSS5-Enhancer runtime is available, "
+        "DLSS5 SR bridge, then nvvfx RTX VSR fallback) at the selected "
+        "upscaling factor, with an optional de-fog / de-haze multiply-blend "
+        "layer applied afterwards. YOLO-guided detection and H3 re-generation "
+        "repair were removed."
     )
 
     # ------------------------------------------------------------------
@@ -557,6 +753,16 @@ class H3VisQuasiDLSS5Refiner:
             dlss_motion_model="Small", dlss_chunk_frames=4,
             dlss_nr_mode="Off", dlss_nr_intensity=1.0,
             dlss_nr_chunk_frames=4, dlss_motion_scale=0.5,
+            dlss5_upscaling_mode="1.5x (Quality)",
+            dlss5_nr_preset="Default", dlss5_nr_style="Default",
+            dlss5_nr_intensity=1.0,
+            dlss5_local_tone_strength=1.0,
+            dlss5_local_structure_strength=1.5,
+            dlss5_skin_structure_strength=2.0,
+            dlss5_automatic_mask=True, dlss5_model_preset="M",
+            dlss5_motion="auto", dlss5_scene_change_threshold=0.24,
+            dlss5_warmup_frames=0, dlss5_flow_width=640,
+            dlss5_runtime_dir="", dlss5_verify_neural_rendering=True,
             defog_enabled=False, defog_strength=0.5):
         torch = _torch()
         if images is None or images.shape[0] == 0:
@@ -595,6 +801,21 @@ class H3VisQuasiDLSS5Refiner:
                 dlss_nr_intensity=float(dlss_nr_intensity),
                 dlss_nr_chunk_frames=int(dlss_nr_chunk_frames),
                 dlss_motion_scale=float(dlss_motion_scale),
+                dlss5_upscaling_mode=str(dlss5_upscaling_mode),
+                dlss5_nr_preset=str(dlss5_nr_preset),
+                dlss5_nr_style=str(dlss5_nr_style),
+                dlss5_nr_intensity=float(dlss5_nr_intensity),
+                dlss5_local_tone_strength=float(dlss5_local_tone_strength),
+                dlss5_local_structure_strength=float(dlss5_local_structure_strength),
+                dlss5_skin_structure_strength=float(dlss5_skin_structure_strength),
+                dlss5_automatic_mask=bool(dlss5_automatic_mask),
+                dlss5_model_preset=str(dlss5_model_preset),
+                dlss5_motion=str(dlss5_motion),
+                dlss5_scene_change_threshold=float(dlss5_scene_change_threshold),
+                dlss5_warmup_frames=int(dlss5_warmup_frames),
+                dlss5_flow_width=int(dlss5_flow_width),
+                dlss5_runtime_dir=str(dlss5_runtime_dir),
+                dlss5_verify_neural_rendering=bool(dlss5_verify_neural_rendering),
             )
 
         # 4) optional de-fog / de-haze look (multiply-blend enhanced layer).
