@@ -4,14 +4,15 @@
 
 ## 完整说明
 
-H3 Vis Quasi-DLSS5 Refiner 是一款面向 MiniMax H3 视频生成管线的**无头超分增强节点**。它把 NVIDIA 超分重建（真 DLSS SR / RTX VSR）直接应用在输入画面上，按 `rtx_scale` 放大并重建细节，可选在放大帧上追加 DLSS 5 Neural Rendering 外观，再叠加可选的去雾（de-fog / de-haze）后期外观。
+H3 Vis Quasi-DLSS5 Refiner 是一款面向 MiniMax H3 视频生成管线的**无头超分增强节点**。它把 NVIDIA 超分重建（真 DLSS 5 Neural Rendering / DLSS SR / RTX VSR）直接应用在输入画面上，按 `rtx_scale` 放大并重建细节，可选在放大帧上追加 DLSS 5 Neural Rendering 外观，再叠加可选的去雾（de-fog / de-haze）后期外观。
 
-相比依赖 H3 二次采样的旧版（YOLO 目标检测 + 潜空间局部重生成 + Mask 回贴），当前版本**移除了全部检测 / 修复 / 回贴链路**，只保留"增强直通"一条路径：输入视频帧 → NVIDIA 超分桥（DLSS5 后端优先，nvvfx RTX VSR 兜底）→（可选）DLSS 5 NR →（可选）去雾，输出增强后的画面。
+相比依赖 H3 二次采样的旧版（YOLO 目标检测 + 潜空间局部重生成 + Mask 回贴），当前版本**移除了全部检测 / 修复 / 回贴链路**，只保留"增强直通"一条路径：输入视频帧 → DLSS5 增强桥（dlss5-native 优先，其次 dlss5 SR，nvvfx RTX VSR 兜底）→（可选）DLSS 5 NR →（可选）去雾，输出增强后的画面。
 
 ## 特性
 
-- **无头超分增强**：`rtx_enhance` 开启后运行 NVIDIA RTX Video Super Resolution / DLSS SR（`rtx_scale` 1.0~2.0x），不可用时自动跳过，不影响主流程。
-- **DLSS5 后端优先**：`rtx_backend=auto` 时存在真 DLSS SR（vsdlsssr.dll）则走 DLSS SR，否则退回 nvvfx RTX VSR；也可强制 `dlss5` / `nvvfx`。
+- **无头超分增强**：`rtx_enhance` 开启后运行 NVIDIA DLSS 5 增强管线（`rtx_scale` 1.0~2.0x），不可用时自动跳过，不影响主流程。
+- **DLSS5-native 后端（Feature 18）**：`rtx_backend=dlss5-native` 时启用真正的 NVIDIA DLSS 5 Neural Rendering——懒加载复用兄弟插件 **ComfyUI-DLSS5-Enhancer** 的 `DlssSession` / `TemporalGuide` 原生管线（nvngx.dll --video worker + DIS 光流时序引导），与 DLSS5-Enhancer 节点效果一致；runtime 缺失时自动回退下一后端。
+- **后端优先级**：`rtx_backend=auto` 时按 **dlss5-native → dlss5 → nvvfx** 依次探测可用后端；也可强制 `dlss5-native` / `dlss5` / `nvvfx`。
 - **DLSS 5 Neural Rendering**（可选）：`dlss_nr_mode` 在 SR 重建后的放大帧上施加 NR 外观（Off / Neutral / faithful / Realistic detail / Strong detail），`dlss_nr_intensity` 调节强度。NR 在独立进程运行，几乎不占 torch 显存。
 - **深度 + 光流引导**：DLSS SR 使用 Depth Anything V2（`dlss_depth_model`）与 RAFT 光流（`dlss_motion_model`）做引导，权重首次使用时自动下载；`dlss_motion_scale=0.5` 半分辨率估光流提速约 4 倍。
 - **两种输出策略**：
@@ -32,7 +33,12 @@ H3 Vis Quasi-DLSS5 Refiner 是一款面向 MiniMax H3 视频生成管线的**无
    ```bash
    pip install nvvfx
    ```
-   DLSS5 桥（`dlss5_bridge.py`）会复用相邻的 `ComfyUI-DLSS5` 包及其隔离运行环境（vsdlssnr.dll / vsdlsssr.dll / bridge_runner.py），缺失时自动降级到 nvvfx 或跳过。
+   **dlss5-native 后端**（真正的 DLSS 5 Neural Rendering）需要安装兄弟插件 **ComfyUI-DLSS5-Enhancer**（含 nvngx.dll / ReShade 运行时），克隆到 `custom_nodes` 即可，运行时目录自动探测、无需额外配置：
+   ```bash
+   git clone https://github.com/YHZR9493/ComfyUI-DLSS5-Enhancer.git
+   ```
+   缺失或 runtime 不可用时自动回退 dlss5 / nvvfx。
+   **dlss5 SR / NR 后端**：`dlss5_bridge.py` 会复用相邻的 `ComfyUI-DLSS5` 包及其隔离运行环境（vsdlssnr.dll / vsdlsssr.dll / bridge_runner.py），缺失时自动降级到 nvvfx 或跳过。
 3. 重启 ComfyUI。
 
 节点位于分类 **`H3 Vis Quasi DLSS5`** 下。
@@ -52,6 +58,7 @@ H3 Vis Quasi-DLSS5 Refiner 是一款面向 MiniMax H3 视频生成管线的**无
 - **ComfyUI 官方核心模块**（随 ComfyUI 自带）：`comfy.utils`、`comfy.model_management` 等。
 - **PyTorch / ComfyUI 自带 torch**。
 - **nvvfx**（可选，仅 nvvfx 后端使用，失败自动跳过）。
+- **ComfyUI-DLSS5-Enhancer**（可选，dlss5-native 后端）：懒加载复用其 `DlssSession` / `TemporalGuide` 原生 DLSS 5 Neural Rendering（Feature 18）管线，缺失时回退下一后端。
 - **ComfyUI-DLSS5 包**（可选，DLSS5 SR / NR 后端）：节点桥自动发现相邻 `custom_nodes/ComfyUI-DLSS5`，缺失时降级到 nvvfx 或跳过。
 
 ## 使用方法
@@ -74,7 +81,7 @@ H3 Vis Quasi-DLSS5 Refiner 是一款面向 MiniMax H3 视频生成管线的**无
 | `rtx_quality` | ULTRA | RTX 超分质量档位 LOW/MEDIUM/HIGH/ULTRA |
 | `rtx_scale` | 1.5 | 超分放大倍率（1.0~2.0） |
 | `rtx_keep_upscaled` | true | true=直接输出放大分辨率；false=缩回原分辨率并回注细节 |
-| `rtx_backend` | auto | 增强引擎：auto / dlss5 / nvvfx |
+| `rtx_backend` | auto | 增强引擎：auto（按 dlss5-native → dlss5 → nvvfx 探测）/ dlss5-native / dlss5 / nvvfx |
 | `dlss_quality` | Quality | DLSS SR 质量预设（Quality/Balanced/Performance/Ultra Performance/Ultra Quality/DLAA） |
 | `dlss_depth_model` | Small | 深度引导模型（Small/Base/Large） |
 | `dlss_motion_model` | Small | 光流引导模型（Small/Large） |
@@ -84,8 +91,24 @@ H3 Vis Quasi-DLSS5 Refiner 是一款面向 MiniMax H3 视频生成管线的**无
 | `dlss_nr_intensity` | 1.0 | NR 效果强度倍率（0.0~1.5） |
 | `dlss_nr_chunk_frames` | 4 | NR 进程帧批大小（1~16，超 2M 像素自动限 2） |
 | `rtx_detail_strength` | 0.85 | 缩回原分辨率时 SR 细节回注强度（仅 keep_upscaled=false） |
+| `dlss5_upscaling_mode` | 1.5x (Quality) | dlss5-native 超分档位：1x (DLAA) / 1.5x (Quality) / 1.724x (Balanced) / 2x (Performance) / 3x (Ultra Performance) |
+| `dlss5_nr_preset` | Default | dlss5-native 神经渲染预设：Default / Preset #1 / Preset #2 / Preset #3 |
+| `dlss5_nr_style` | Default | dlss5-native 外观风格：Default / Natural / Cinematic |
+| `dlss5_nr_intensity` | 1.0 | dlss5-native NR 整体强度倍率（0.0~2.0） |
+| `dlss5_local_tone_strength` | 1.0 | dlss5-native 局部色调强度（0.0~2.0） |
+| `dlss5_local_structure_strength` | 1.5 | dlss5-native 局部结构强度（0.0~2.0） |
+| `dlss5_skin_structure_strength` | 2.0 | dlss5-native 皮肤结构强度（-1.0~2.0） |
+| `dlss5_automatic_mask` | true | dlss5-native 自动掩码（面部保护等） |
+| `dlss5_model_preset` | M | dlss5-native 模型预设：Default / J / K / L / M（驱动不支持时改回 Default） |
+| `dlss5_motion` | auto | dlss5-native 运动引导：auto / optical_flow / none |
+| `dlss5_scene_change_threshold` | 0.24 | dlss5-native 场景切换阈值（0.01~1.0，光流异常时重置时序累积） |
+| `dlss5_warmup_frames` | 0 | dlss5-native 预热帧数（0~16，前 N 帧不输出、用于稳定时序） |
+| `dlss5_flow_width` | 640 | dlss5-native 光流计算宽度（64~4096） |
+| `dlss5_verify_neural_rendering` | true | dlss5-native 渲染后校验 ReShade 日志确认 Feature-18 真正执行，未执行则回退下一后端 |
 | `defog_enabled` | false | 去雾后期外观开关 |
 | `defog_strength` | 0.5 | 去雾强度（0.0~1.0） |
+
+> 说明：`dlss5_runtime_dir` 参数已从 UI 移除，dlss5-native 运行时目录改为自动探测（ComfyUI-DLSS5-Enhancer 打包目录）；旧工作流 JSON 中该键仍被安全接受（签名保留形参并透传，空串即自动探测）。
 
 ### 输出
 
@@ -100,6 +123,8 @@ H3 Vis Quasi-DLSS5 Refiner 是一款面向 MiniMax H3 视频生成管线的**无
 - `model` / `video_vae` / `clip` 仅保留以兼容旧工作流，当前版本不参与推理。
 
 ## 更新日志
+
+- **2026-09-21**：接入 **dlss5-native 后端**（DLSS 5 Neural Rendering，Feature 18）——懒加载复用兄弟插件 ComfyUI-DLSS5-Enhancer 的 `DlssSession` / `TemporalGuide` 管线，效果与 DLSS5-Enhancer 节点一致；`rtx_backend` 新增 `dlss5-native` 选项，auto 优先级 `dlss5-native → dlss5 → nvvfx`；新增 15 个 `dlss5_*` 参数；移除 `dlss5_runtime_dir` UI 参数、运行时目录自动探测。
 
 ### 2026-09-15 — 精简为纯超分增强节点（v2）
 
